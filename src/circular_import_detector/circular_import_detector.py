@@ -130,41 +130,57 @@ class CircularImportDetector:
 
     def _resolve_import_to_module(self, raw: str, src_module: Optional[str] = None) -> Optional[str]:
         """
-        Resolve a raw import string (absolute or relative) to a module present in module_to_file.
-        Returns the *longest existing prefix*. If not resolvable, returns None.
+        Resolve a raw import string (absolute or relative) to a module we actually
+        scanned (present in self.module_to_file). Handles 'from .x import y' properly
+        from both packages (__init__.py) and submodules.
         """
-        candidate: str
-        raw = raw.strip(".")
-        if raw.startswith("."):  # (shouldn't happen after strip, but keep for safety)
-            raw = raw.lstrip(".")
+        if not raw:
+            return None
 
-        if raw and raw[0] == ".":  # very defensive
-            # Shouldn't hit since we stripped, but keep behavior consistent
-            if not src_module:
-                return None
+        # Count leading dots for relative imports
+        i = 0
+        while i < len(raw) and raw[i] == '.':
+            i += 1
+        rel = i
+        tail = raw[rel:]  # may include module segments and/or symbol name
 
-        if raw and raw[0] != ".":  # absolute like "pkg.sub.mod" or "pkg"
-            candidate = raw
+        if rel == 0:
+            # Absolute import: try longest-prefix match
+            parts = [p for p in tail.split('.') if p]
+            for j in range(len(parts), 0, -1):
+                cand = '.'.join(parts[:j])
+                if cand in self.module_to_file:
+                    return cand
+            return None
+
+        # Relative import — need src_module context
+        if not src_module:
+            return None
+
+        # Determine the *current package* of the source module
+        # - if src is a package (__init__.py), package == src_module
+        # - else package == parent of src_module
+        src_file = self.module_to_file.get(src_module, "")
+        is_pkg = src_file.endswith(os.sep + "__init__.py")
+        if is_pkg:
+            pkg_parts = src_module.split('.')
         else:
-            # Relative form like "..sub.mod" / "." – need src_module context
-            if not src_module:
-                return None
-            # Count leading dots before strip (reconstruct)
-            up = 0
-            for ch in raw:
-                if ch == ".":
-                    up += 1
-                else:
-                    break
-            tail = raw[up:]
-            base_parts = src_module.split(".")
-            base = base_parts[:-up] if up <= len(base_parts) else []
-            candidate = ".".join([*base, *([tail] if tail else [])]).strip(".")
+            pkg_parts = src_module.split('.')[:-1]  # parent package (may be [])
 
-        # Longest-prefix match
-        parts = [p for p in candidate.split(".") if p]
-        for i in range(len(parts), 0, -1):
-            cand = ".".join(parts[:i])
+        # In Python, a single leading dot means "current package" (no upward move).
+        # So we go up (rel - 1) packages.
+        up = max(rel - 1, 0)
+        if up >= len(pkg_parts):
+            base_parts = []
+        else:
+            base_parts = pkg_parts[:-up] if up else pkg_parts
+
+        tail_parts = [p for p in tail.split('.') if p]
+        candidate_parts = base_parts + tail_parts
+
+        # Longest-prefix match against modules we actually scanned
+        for j in range(len(candidate_parts), 0, -1):
+            cand = '.'.join(candidate_parts[:j])
             if cand in self.module_to_file:
                 return cand
         return None
@@ -229,7 +245,7 @@ class CircularImportDetector:
         for src_module, recs in self._raw_import_locs.items():
             for raw, lineno, _kind, file_path in recs:
                 tgt = self._resolve_import_to_module(raw, src_module)
-                if not tgt:
+                if not tgt or tgt == src_module:  # <-- skip self-edges
                     continue
                 self.module_graph[src_module].add(tgt)
                 self.edge_meta[(src_module, tgt)].append((file_path, lineno, raw))
