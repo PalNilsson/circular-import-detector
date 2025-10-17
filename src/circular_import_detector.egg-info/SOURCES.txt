@@ -1,10 +1,12 @@
 LICENSE
 README.md
 pyproject.toml
-src/circular-import-detector/circular_import_detector.py
-src/circular-import-detector/example_usage.py
-src/circular-import-detector/precommit_hook.py
-src/circular-import-detector/test_circular_imports.py
+src/circular_import_detector/__init__.py
+src/circular_import_detector/__main__.py
+src/circular_import_detector/circular_import_detector.py
+src/circular_import_detector/example_usage.py
+src/circular_import_detector/precommit_hook.py
+src/circular_import_detector/test_circular_imports.py
 src/circular_import_detector.egg-info/PKG-INFO
 src/circular_import_detector.egg-info/SOURCES.txt
 src/circular_import_detector.egg-info/dependency_links.txt

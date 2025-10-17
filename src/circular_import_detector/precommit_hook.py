@@ -9,7 +9,7 @@ the files that are being committed.
 import sys
 import argparse
 from pathlib import Path
-from circular_import_detector import CircularImportDetector
+from .circular_import_detector import CircularImportDetector
 
 
 def main():

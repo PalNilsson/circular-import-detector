@@ -1,1 +1,1 @@
-circular-import-detector
+circular_import_detector
