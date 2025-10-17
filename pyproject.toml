@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "circular-import-detector"
+version = "1.0.0"
+description = "A tool to detect circular imports in Python projects"
+authors = [
+    {name = "Paul Nilsson", email = "Paul.Nilsson@cern.ch"}
+]
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/PalNilsson/circular-import-detector"
+Repository = "https://github.com/PalNilsson/circular-import-detector.git"
+Issues = "https://github.com/PalNilsson/circular-import-detector/issues"
+
+[project.scripts]
+circular-import-detector = "circular_import_detector:main"
+circular-import-precommit = "precommit_hook:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}  # tell setuptools where packages live
+
+# Use package discovery:
+[tool.setuptools.packages.find]
+where = ["src"]              # search inside src/
