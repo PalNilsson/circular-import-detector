@@ -77,13 +77,14 @@ The tool is designed to work seamlessly with [pre-commit](https://pre-commit.com
 ```yaml
 -   repo: local
     hooks:
-    -   id: circular-imports
-        name: Check for circular imports
+      - id: circular-imports
+        name: Check for circular imports (changed files)
         entry: circular-import-precommit
         language: python
         additional_dependencies:
-          - circular-import-detector==1.0.4   # pin the version you need
-        pass_filenames: false
+          - circular-import-detector==1.0.18
+        pass_filenames: true
+        types_or: [python]
         stages: [pre-commit]
 ```
 

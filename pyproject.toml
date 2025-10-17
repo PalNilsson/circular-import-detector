@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "circular-import-detector"
-version = "1.0.17"
+version = "1.0.18"
 description = "A tool to detect circular imports in Python projects"
 authors = [
     {name = "Paul Nilsson", email = "Paul.Nilsson@cern.ch"}
