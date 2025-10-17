@@ -1,321 +1,326 @@
-#!/usr/bin/env python3
-"""
-Circular Import Detector
+from __future__ import annotations
 
-A tool to detect circular imports in Python projects by analyzing import statements
-and building a dependency graph to identify cycles.
-"""
-
+import argparse
 import ast
 import os
-import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
 
-class ImportAnalyzer(ast.NodeVisitor):
-    """AST visitor to extract import information from Python files."""
+# --------- AST collection -----------------------------------------------------
 
-    def __init__(self, module_path: str, project_root: Path):
-        self.module_path = module_path
-        self.project_root = project_root
-        self.imports: Set[str] = set()
-        self.from_imports: Set[str] = set()
+@dataclass(frozen=True)
+class ImportRecord:
+    raw: str        # raw dotted target as written (may be relative like "..sub.mod")
+    lineno: int     # 1-based line number
+    kind: str       # "import" | "from"
+
+
+class ImportAnalyzer(ast.NodeVisitor):
+    """Collect full import targets and line numbers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: List[ImportRecord] = []
 
     def visit_Import(self, node: ast.Import) -> None:
-        """Handle 'import module' statements."""
         for alias in node.names:
-            self.imports.add(alias.name.split('.')[0])
+            raw = alias.name  # keep full dotted module
+            self.records.append(ImportRecord(raw=raw, lineno=node.lineno, kind="import"))
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        """Handle 'from module import ...' statements."""
-        if node.module:
-            # Handle relative imports
-            if node.level > 0:
-                module_name = self._resolve_relative_import(node.module, node.level)
-            else:
-                module_name = node.module
-
-            if module_name:
-                self.from_imports.add(module_name.split('.')[0])
+        # build a base like "..pkg.sub" (relative dots + module)
+        base = ('.' * (node.level or 0)) + (node.module or '')
+        if node.names and any(a.name == "*" for a in node.names):
+            raw = base or "."
+            self.records.append(ImportRecord(raw=raw, lineno=node.lineno, kind="from"))
+        else:
+            sep = '.' if node.module else ''
+            for a in node.names:
+                raw = f"{base}{sep}{a.name}"
+                self.records.append(ImportRecord(raw=raw, lineno=node.lineno, kind="from"))
         self.generic_visit(node)
 
-    def _resolve_relative_import(self, module: Optional[str], level: int) -> Optional[str]:
-        """Resolve relative imports to absolute module names."""
-        try:
-            current_path = Path(self.module_path).relative_to(self.project_root)
-            if current_path.name == '__init__.py':
-                current_module_parts = current_path.parts[:-1]
-            else:
-                current_module_parts = current_path.parts[:-1]
 
-            # Go up 'level' directories
-            if level > len(current_module_parts):
-                return None
-
-            # Calculate base path after going up levels
-            if level == 0:
-                base_parts = current_module_parts
-            else:
-                base_parts = current_module_parts[:-level] if level <= len(current_module_parts) else ()
-
-            if module:
-                result_parts = base_parts + tuple(module.split('.'))
-                return '.'.join(result_parts) if result_parts else module
-            else:
-                return '.'.join(base_parts) if base_parts else None
-        except ValueError:
-            return None
-
+# --------- Core detector ------------------------------------------------------
 
 class CircularImportDetector:
-    """Main class for detecting circular imports in Python projects."""
+    def __init__(self, project_path: str | os.PathLike[str]) -> None:
+        self.project_root = Path(project_path).resolve()
 
-    def __init__(self, project_root: str):
-        """Initialize the detector with the project root directory."""
-        self.project_root = Path(project_root).resolve()
-        self.module_graph: Dict[str, Set[str]] = defaultdict(set)
-        self.file_to_module: Dict[str, str] = {}
-        self.module_to_file: Dict[str, str] = {}
+        # Prefer src/ layout when present
+        self.scan_root: Path = (self.project_root / "src") if (self.project_root / "src").is_dir() else self.project_root
+
+        # Graphs & indices
+        self.module_graph: Dict[str, Set[str]] = defaultdict(set)  # module -> set(imported modules)
+        self.module_to_file: Dict[str, str] = {}                  # module -> file path
+        self.file_to_module: Dict[str, str] = {}                  # file path -> module
+
+        # Raw import collection with locations
+        self._raw_import_locs: Dict[str, List[Tuple[str, int, str, str]]] = {}
+        # maps src_module -> list of (raw, lineno, kind, file_path)
+
+        # Edge metadata for pretty printing
+        self.edge_meta: Dict[Tuple[str, str], List[Tuple[str, int, str]]] = defaultdict(list)
+        # maps (src_module, dst_module) -> list of (file_path, lineno, raw)
+
+    # ----- File system helpers -----
 
     def find_python_files(self) -> List[Path]:
-        """Find all Python files in the project directory."""
-        python_files = []
-        for root, dirs, files in os.walk(self.project_root):
-            # Skip common non-source directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('__pycache__', 'build', 'dist', 'egg-info')]
+        """Walk the repo and return .py files under scan_root (skip common junk)."""
+        skip_dirs = {
+            ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
+            ".tox", "build", "dist", "node_modules", ".venv", "venv", ".eggs",
+            ".ruff_cache", ".ruff_cache", ".idea", ".vscode"
+        }
+        files: List[Path] = []
+        for root, dirs, filenames in os.walk(self.scan_root):
+            # prune
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.endswith(".egg-info")]
+            for fn in filenames:
+                if fn.endswith(".py"):
+                    files.append(Path(root) / fn)
+        return files
 
-            for file in files:
-                if file.endswith('.py') and not file.startswith('.'):
-                    python_files.append(Path(root) / file)
+    def _path_to_module(self, file_path: Path) -> str:
+        """
+        Convert a python file path to a dotted module name, supporting src/ layout
+        and namespace packages (PEP 420 – no __init__.py).
+        """
+        rel = file_path.resolve().relative_to(self.scan_root)
+        parts = list(rel.parts)
+        if parts[-1] == "__init__.py":
+            parts = parts[:-1]
+        else:
+            parts[-1] = parts[-1][:-3]  # strip .py
+        # Drop empty segments and join with dots
+        parts = [p for p in parts if p and p not in (".",)]
+        return ".".join(parts)
 
-        return python_files
-
-    def get_module_name(self, file_path: Path) -> str:
-        """Convert file path to module name."""
-        try:
-            rel_path = file_path.relative_to(self.project_root)
-            if rel_path.name == '__init__.py':
-                # For __init__.py files, use the parent directory name
-                module_parts = rel_path.parts[:-1]
-                if not module_parts:  # Handle root __init__.py
-                    return file_path.parent.name
-                return '.'.join(module_parts)
-            else:
-                # For regular .py files, use the filename without extension
-                module_parts = rel_path.parts[:-1] + (rel_path.stem,)
-                return '.'.join(module_parts) if module_parts else rel_path.stem
-        except ValueError:
-            return file_path.stem
+    # ----- Parsing / indexing -----
 
     def analyze_file(self, file_path: Path) -> None:
-        """Analyze a single Python file for imports."""
+        """Parse a file, record its module name and import records."""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            text = file_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+        try:
+            tree = ast.parse(text, filename=str(file_path))
+        except SyntaxError:
+            return
 
-            tree = ast.parse(content, filename=str(file_path))
-            analyzer = ImportAnalyzer(str(file_path), self.project_root)
-            analyzer.visit(tree)
+        analyzer = ImportAnalyzer()
+        analyzer.visit(tree)
 
-            module_name = self.get_module_name(file_path)
-            self.file_to_module[str(file_path)] = module_name
-            self.module_to_file[module_name] = str(file_path)
+        module_name = self._path_to_module(file_path)
+        abs_path = str(file_path.resolve())
 
-            # Store raw imports for later processing after all files are analyzed
-            all_imports = analyzer.imports | analyzer.from_imports
-            self._raw_imports = getattr(self, '_raw_imports', {})
-            self._raw_imports[module_name] = all_imports
+        # Index
+        self.module_to_file[module_name] = abs_path
+        self.file_to_module[abs_path] = module_name
 
-        except (SyntaxError, UnicodeDecodeError) as e:
-            print(f"Warning: Could not parse {file_path}: {e}", file=sys.stderr)
+        # Store raw import locations: (raw, lineno, kind, file)
+        self._raw_import_locs[module_name] = [(r.raw, r.lineno, r.kind, abs_path) for r in analyzer.records]
 
-    def _filter_internal_imports(self, imports: Set[str]) -> Set[str]:
-        """Filter imports to only include internal project modules."""
-        internal_imports = set()
+    # ----- Import resolution -----
 
-        for imp in imports:
-            # Check if this import corresponds to a file in our project
-            potential_paths = [
-                self.project_root / f"{imp}.py",
-                self.project_root / imp / "__init__.py"
-            ]
+    def _resolve_import_to_module(self, raw: str, src_module: Optional[str] = None) -> Optional[str]:
+        """
+        Resolve a raw import string (absolute or relative) to a module present in module_to_file.
+        Returns the *longest existing prefix*. If not resolvable, returns None.
+        """
+        candidate: str
+        raw = raw.strip(".")
+        if raw.startswith("."):  # (shouldn't happen after strip, but keep for safety)
+            raw = raw.lstrip(".")
 
-            # Also check if it matches any known module in our project
-            # This helps with package imports like 'from package import module'
-            for module_name in self.module_to_file.keys():
-                if module_name == imp or module_name.endswith(f'.{imp}'):
-                    internal_imports.add(imp)
+        if raw and raw[0] == ".":  # very defensive
+            # Shouldn't hit since we stripped, but keep behavior consistent
+            if not src_module:
+                return None
+
+        if raw and raw[0] != ".":  # absolute like "pkg.sub.mod" or "pkg"
+            candidate = raw
+        else:
+            # Relative form like "..sub.mod" / "." – need src_module context
+            if not src_module:
+                return None
+            # Count leading dots before strip (reconstruct)
+            up = 0
+            for ch in raw:
+                if ch == ".":
+                    up += 1
+                else:
                     break
-            else:
-                # Check file system if module not yet processed
-                if any(p.exists() for p in potential_paths):
-                    internal_imports.add(imp)
+            tail = raw[up:]
+            base_parts = src_module.split(".")
+            base = base_parts[:-up] if up <= len(base_parts) else []
+            candidate = ".".join([*base, *([tail] if tail else [])]).strip(".")
 
-                # Also check subdirectories
-                for subdir in self.project_root.rglob("*"):
-                    if subdir.is_dir():
-                        subdir_paths = [
-                            subdir / f"{imp}.py",
-                            subdir / imp / "__init__.py"
-                        ]
-                        if any(p.exists() for p in subdir_paths):
-                            internal_imports.add(imp)
-                            break
-
-        return internal_imports
-
-    def _resolve_import_to_module(self, import_name: str) -> Optional[str]:
-        """Resolve an import name to the actual module name in our project."""
-        # Direct module name match
-        if import_name in self.module_to_file:
-            return import_name
-
-        # Check if any module ends with this import name (for package imports)
-        for module_name in self.module_to_file:
-            if module_name == import_name:
-                return module_name
-            # Handle package.module imports
-            if module_name.endswith(f'.{import_name}'):
-                return module_name
-            # Handle just the base name
-            if module_name.split('.')[-1] == import_name:
-                return module_name
-
+        # Longest-prefix match
+        parts = [p for p in candidate.split(".") if p]
+        for i in range(len(parts), 0, -1):
+            cand = ".".join(parts[:i])
+            if cand in self.module_to_file:
+                return cand
         return None
 
-    def find_cycles(self) -> List[List[str]]:
-        """Find all circular import cycles using DFS."""
-        visited = set()
-        rec_stack = set()
-        cycles = []
+    # ----- SCC (Tarjan) -----
 
-        def dfs(node: str, path: List[str]) -> None:
-            if node in rec_stack:
-                # Found a cycle
-                cycle_start = path.index(node)
-                cycle = path[cycle_start:] + [node]
-                cycles.append(cycle)
-                return
+    def _tarjan_scc(self, graph: Dict[str, Set[str]]) -> List[List[str]]:
+        index = 0
+        stack: List[str] = []
+        onstack: Set[str] = set()
+        indices: Dict[str, int] = {}
+        low: Dict[str, int] = {}
+        sccs: List[List[str]] = []
 
-            if node in visited:
-                return
+        def strongconnect(v: str) -> None:
+            nonlocal index
+            indices[v] = index
+            low[v] = index
+            index += 1
+            stack.append(v)
+            onstack.add(v)
 
-            visited.add(node)
-            rec_stack.add(node)
-            path.append(node)
+            for w in graph.get(v, ()):
+                if w not in indices:
+                    strongconnect(w)
+                    low[v] = min(low[v], low[w])
+                elif w in onstack:
+                    low[v] = min(low[v], indices[w])
 
-            for neighbor in self.module_graph.get(node, set()):
-                dfs(neighbor, path.copy())
+            if low[v] == indices[v]:
+                comp: List[str] = []
+                while True:
+                    w = stack.pop()
+                    onstack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                sccs.append(comp)
 
-            rec_stack.remove(node)
+        for v in list(graph.keys()):
+            if v not in indices:
+                strongconnect(v)
+        return sccs
 
-        for module in self.module_graph:
-            if module not in visited:
-                dfs(module, [])
-
-        return cycles
+    # ----- Public detection API -----
 
     def detect_circular_imports(self) -> Tuple[bool, List[List[str]]]:
         """
-        Main method to detect circular imports in the project.
-
-        Returns:
-            Tuple of (has_cycles, list_of_cycles)
+        Scan, build dependency graph (module level), and find all circular groups.
+        Returns (has_cycles, groups). Each group is a list of modules forming an SCC.
         """
-        python_files = self.find_python_files()
+        # Reset state
+        self.module_graph.clear()
+        self._raw_import_locs.clear()
+        self.edge_meta.clear()
 
-        if not python_files:
-            print("No Python files found in the project directory.", file=sys.stderr)
-            return False, []
-
-        # First pass: Analyze all Python files to build module mappings
-        for file_path in python_files:
+        # 1) Scan all Python files and collect raw imports + locations
+        for file_path in self.find_python_files():
             self.analyze_file(file_path)
 
-        # Second pass: Process imports now that all modules are known
-        self._raw_imports = getattr(self, '_raw_imports', {})
-        for module_name, raw_imports in self._raw_imports.items():
-            internal_imports = self._filter_internal_imports(raw_imports)
-            # Map import names to actual module names
-            resolved_imports = set()
-            for imp in internal_imports:
-                # Try to find the actual module name for this import
-                resolved_module = self._resolve_import_to_module(imp)
-                if resolved_module:
-                    resolved_imports.add(resolved_module)
-            self.module_graph[module_name].update(resolved_imports)
+        # 2) Build directed graph + edge metadata
+        for src_module, recs in self._raw_import_locs.items():
+            for raw, lineno, _kind, file_path in recs:
+                tgt = self._resolve_import_to_module(raw, src_module)
+                if not tgt:
+                    continue
+                self.module_graph[src_module].add(tgt)
+                self.edge_meta[(src_module, tgt)].append((file_path, lineno, raw))
 
-        # Find cycles
-        cycles = self.find_cycles()
+        # Ensure all targets appear as nodes
+        for v, nbrs in list(self.module_graph.items()):
+            for w in nbrs:
+                self.module_graph.setdefault(w, set())
 
-        return len(cycles) > 0, cycles
+        # 3) SCC
+        sccs = self._tarjan_scc(self.module_graph)
 
-    def format_cycles(self, cycles: List[List[str]]) -> str:
-        """Format cycles for human-readable output."""
+        # 4) Keep only cycles (SCC size>1) or self-loops
+        groups: List[List[str]] = []
+        for comp in sccs:
+            if len(comp) > 1:
+                groups.append(sorted(comp))
+            elif comp:
+                m = comp[0]
+                if m in self.module_graph.get(m, set()):
+                    groups.append([m])
+
+        return (bool(groups), groups)
+
+    # ----- Formatting -----
+
+    def format_cycles(self, cycles: List[List[str]], show_snippet: bool = False) -> str:
         if not cycles:
             return "No circular imports detected."
 
-        output = f"Found {len(cycles)} circular import cycle(s):\n\n"
-
+        out = [f"Found {len(cycles)} circular import group(s):", ""]
         for i, cycle in enumerate(cycles, 1):
-            output += f"Cycle {i}:\n"
-            for j, module in enumerate(cycle):
-                if j == len(cycle) - 1:
-                    output += f"  {module} -> {cycle[0]} (circular)\n"
-                else:
-                    output += f"  {module} -> {cycle[j + 1]}\n"
+            out.append(f"Group {i}:")
+            ring = " -> ".join(cycle + [cycle[0]])
+            out.append(f"  {ring}")
 
-            # Add file paths if available
-            output += "  Files involved:\n"
-            unique_modules = list(dict.fromkeys(cycle))  # Remove duplicates while preserving order
-            for module in unique_modules:
-                file_path = self.module_to_file.get(module, "Unknown file")
-                output += f"    {module}: {file_path}\n"
-            output += "\n"
+            # Explain the exact edges with file+line
+            out.append("  Explicit imports causing this cycle:")
+            for a, b in zip(cycle, cycle[1:] + [cycle[0]]):
+                sites = self.edge_meta.get((a, b), [])
+                if not sites:
+                    out.append(f"    {a} → {b}: (location unknown)")
+                    continue
+                for j, (fp, lineno, raw) in enumerate(sites[:3], 1):
+                    loc = f"{fp}:{lineno}" if lineno else fp
+                    out.append(f"    {a} → {b}: {loc}   import '{raw}'")
+                    if show_snippet and lineno:
+                        try:
+                            line = Path(fp).read_text(encoding="utf-8").splitlines()[lineno - 1].rstrip()
+                            out.append(f"      > {line}")
+                        except Exception:
+                            pass
+                if len(sites) > 3:
+                    out.append(f"    … {len(sites)-3} more location(s)")
 
-        return output.strip()
+            # Files involved (summary)
+            out.append("  Files involved:")
+            for mod in cycle:
+                p = self.module_to_file.get(mod)
+                if p:
+                    out.append(f"    {mod}: {p}")
+            out.append("")
+        return "\n".join(out).rstrip()
 
 
-def main():
-    """CLI entry point for the circular import detector."""
-    import argparse
+# --------- CLI ---------------------------------------------------------------
 
-    parser = argparse.ArgumentParser(description="Detect circular imports in Python projects")
-    parser.add_argument(
-        "project_path",
-        nargs="?",
-        default=".",
-        help="Path to the Python project directory (default: current directory)"
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Detect circular imports in Python projects",
+        prog="circular-import-detector",
     )
-    parser.add_argument(
-        "--quiet",
-        "-q",
-        action="store_true",
-        help="Only output if circular imports are found"
-    )
-    parser.add_argument(
-        "--exit-code",
-        action="store_true",
-        help="Exit with code 1 if circular imports are found (useful for CI/CD)"
-    )
+    parser.add_argument("project_path", nargs="?", default=".", help="Path to the Python project directory (default: current directory)")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Only output if circular imports are found")
+    parser.add_argument("--exit-code", action="store_true", help="Exit with code 1 if circular imports are found (useful for CI/CD)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show import source lines for each edge")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     detector = CircularImportDetector(args.project_path)
     has_cycles, cycles = detector.detect_circular_imports()
 
     if has_cycles:
-        print(detector.format_cycles(cycles))
-        if args.exit_code:
-            sys.exit(1)
+        print(detector.format_cycles(cycles, show_snippet=args.verbose))
     elif not args.quiet:
         print("No circular imports detected.")
 
-    sys.exit(0)
+    if args.exit_code and has_cycles:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

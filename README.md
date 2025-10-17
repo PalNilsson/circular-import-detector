@@ -74,17 +74,18 @@ The tool is designed to work seamlessly with [pre-commit](https://pre-commit.com
    ```
 
 2. **Add to your `.pre-commit-config.yaml`**:
-   ```yaml
-   repos:
-     - repo: local
-       hooks:
-         - id: circular-imports
-           name: Check for circular imports
-           entry: python precommit_hook.py
-           language: system
-           files: \.py$
-           pass_filenames: true
-   ```
+```yaml
+-   repo: local
+    hooks:
+    -   id: circular-imports
+        name: Check for circular imports
+        entry: circular-import-precommit
+        language: python
+        additional_dependencies:
+          - circular-import-detector==1.0.4   # pin the version you need
+        pass_filenames: false
+        stages: [pre-commit]
+```
 
 3. **Install the hooks**:
    ```bash
@@ -151,23 +152,6 @@ The detector automatically:
 - Skips common non-source directories (`.git`, `__pycache__`, `build`, `dist`, etc.)
 - Handles package structures correctly
 - Converts file paths to proper module names
-
-### Custom Pre-commit Configuration
-
-You can customize the pre-commit hook behavior:
-
-```yaml
-repos:
-  - repo: local
-    hooks:
-      - id: circular-imports
-        name: Check for circular imports
-        entry: python precommit_hook.py --project-root .
-        language: system
-        files: \.py$
-        pass_filenames: true
-        args: ['--project-root', '.']
-```
 
 ## Common Circular Import Patterns
 
@@ -249,12 +233,3 @@ python circular_import_detector.py .
 ## License
 
 MIT License - see LICENSE file for details.
-
-## Changelog
-
-### v1.0.0
-- Initial release
-- Basic circular import detection
-- Pre-commit hook integration
-- Comprehensive test suite
-- CLI interface with multiple options
