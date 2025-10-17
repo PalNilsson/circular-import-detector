@@ -15,6 +15,7 @@ repos:
     hooks:
     -   id: circular-imports
         name: Check for circular imports
-        entry: python precommit_hook.py
+        entry: python3 src/circular-import-detector/precommit_hook.py
         language: system
+        pass_filenames: false
         files: \.py$

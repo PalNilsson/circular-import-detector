@@ -1,0 +1,3 @@
+[console_scripts]
+circular-import-detector = circular_import_detector:main
+circular-import-precommit = precommit_hook:main
