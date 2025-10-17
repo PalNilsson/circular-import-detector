@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: circular-import-detector
-Version: 1.0.15
+Version: 1.0.17
 Summary: A tool to detect circular imports in Python projects
 Author-email: Paul Nilsson <Paul.Nilsson@cern.ch>
 Project-URL: Homepage, https://github.com/PalNilsson/circular-import-detector
